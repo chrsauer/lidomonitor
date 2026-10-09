@@ -1,0 +1,21 @@
+services:
+  lidomonitor:
+    build: .
+    image: lidomonitor:latest
+    container_name: lidomonitor
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - lidomonitor-data:/data
+    # Erlaubt Zugriff auf Nodes, die auf demselben Host laufen:
+    # BEACON_URLS=http://host.docker.internal:5052
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  lidomonitor-data:
