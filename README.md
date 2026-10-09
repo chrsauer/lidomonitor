@@ -55,9 +55,7 @@ docker compose logs -f
 git pull && docker compose up -d --build
 ```
 
-**Zum Netzwerk:**
-- Laufen Beacon- oder EL-Nodes auf **demselben Host**, ist `localhost` aus dem Container nicht erreichbar. Nutzt dann `http://host.docker.internal:5052`; der Eintrag ist in der `docker-compose.yml` vorbereitet. Der Node muss dafür auf `0.0.0.0` oder auf der Docker-Bridge lauschen, nicht nur auf `127.0.0.1`.
-- Alternativ in `docker-compose.yml` `network_mode: host` setzen, dann funktioniert `localhost` direkt.
+**Zum Netzwerk:** Der Container läuft im Host-Netzwerk (`network_mode: host`). Nodes auf demselben Server erreicht er daher direkt über `localhost`, z. B. `http://localhost:8545`. Nodes auf anderen Servern werden ganz normal über IP oder Hostnamen eingetragen. Der Monitor öffnet selbst keine Ports.
 
 **Zustand:** `state.json` liegt im Docker-Volume `lidomonitor-data` und übersteht Neustarts und Updates. Docker meldet den Container als `unhealthy`, wenn er länger als 5 Minuten keinen Slot verarbeitet hat.
 

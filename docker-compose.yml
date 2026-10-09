@@ -7,10 +7,10 @@ services:
     env_file: .env
     volumes:
       - lidomonitor-data:/data
-    # Erlaubt Zugriff auf Nodes, die auf demselben Host laufen:
-    # BEACON_URLS=http://host.docker.internal:5052
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    # Host-Netzwerk: Nodes auf demselben Server sind direkt über localhost
+    # erreichbar (z. B. EXECUTION_URLS=http://localhost:8545).
+    # Der Monitor öffnet selbst keine Ports.
+    network_mode: host
     logging:
       driver: json-file
       options:
