@@ -197,7 +197,15 @@ def eth_call(data: str) -> bytes:
         resp = http_json(url, data=payload, timeout=60)
         if "error" in resp:
             raise RuntimeError(f"eth_call: {resp['error']}")
-        return bytes.fromhex(resp["result"][2:])
+        result = bytes.fromhex(resp["result"][2:])
+        if not result:
+            # Kein Contract-Code an dieser Adresse: Node nicht synchron
+            # oder falsches Netzwerk -> nächsten Node versuchen
+            raise RuntimeError(
+                f"{url}: leere Antwort vom Lido-Contract "
+                "(Node nicht synchron oder falsches Netzwerk?)"
+            )
+        return result
 
     return el_pool.request(call)
 
@@ -208,6 +216,8 @@ def fetch_pubkeys_el() -> list[str]:
     # (bool active, string name, address reward, uint64 vetted, uint64 exited,
     #  uint64 added, uint64 deposited)
     deposited = int.from_bytes(info[6 * 32 : 7 * 32], "big")
+    if deposited == 0:
+        raise RuntimeError(f"Operator {OPERATOR_ID} hat laut Contract 0 deponierte Keys")
     keys: list[str] = []
     for offset in range(0, deposited, KEYS_BATCH):
         limit = min(KEYS_BATCH, deposited - offset)
@@ -309,9 +319,10 @@ class Monitor:
             return
         try:
             vals = resolve_validators(fetch_operator_pubkeys())
-            if vals:
-                self.validators = vals
-                self.keys_loaded_at = time.time()
+            if not vals:
+                raise RuntimeError("0 aktive Validatoren gefunden")
+            self.validators = vals
+            self.keys_loaded_at = time.time()
         except Exception as e:  # noqa: BLE001
             log.error("Konnte Keys nicht aktualisieren: %s", e)
             if not self.validators:
@@ -491,16 +502,18 @@ class Monitor:
         self.daily_summary()
 
     def run(self) -> None:
-        self.refresh_keys(force=True)
-        telegram(
-            f"🟢 Monitor gestartet – Lido Operator {OPERATOR_ID}\n"
-            f"{len(self.validators)} Validatoren · "
-            f"{len(BEACON_URLS)} Beacon / {len(EXECUTION_URLS)} EL Nodes",
-            silent=True,
-        )
+        started = False
         while True:
             try:
                 self.tick()
+                if not started:
+                    telegram(
+                        f"🟢 Monitor gestartet – Lido Operator {OPERATOR_ID}\n"
+                        f"{len(self.validators)} Validatoren · "
+                        f"{len(BEACON_URLS)} Beacon / {len(EXECUTION_URLS)} EL Nodes",
+                        silent=True,
+                    )
+                    started = True
                 if self.error_alerted:
                     telegram("✅ Monitor läuft wieder normal.")
                 self.error_since, self.error_alerted = None, False
@@ -543,12 +556,36 @@ def healthcheck() -> None:
     sys.exit(0 if ok else 1)
 
 
+def el_diagnose(url: str) -> str:
+    """Kurzer Zustandsbericht eines EL-Nodes (Netzwerk, Block, Sync)."""
+
+    def rpc(method, params=None):
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}
+        return http_json(url, data=payload, timeout=15).get("result")
+
+    chain = int(rpc("eth_chainId"), 16)
+    block = int(rpc("eth_blockNumber"), 16)
+    syncing = rpc("eth_syncing")
+    code = rpc("eth_getCode", [NOR_ADDRESS, "latest"]) or "0x"
+    parts = [
+        f"chainId={chain}" + ("" if chain == 1 else " (NICHT Mainnet!)"),
+        f"Block={block}",
+        "synchron" if syncing is False else f"SYNC LÄUFT ({syncing})",
+        "Lido-Contract gefunden" if len(code) > 2 else "Lido-Contract NICHT gefunden",
+    ]
+    return ", ".join(parts)
+
+
 def check_keys() -> None:
     """Vergleicht die Keys aller EL-Nodes mit der Lido Keys API."""
     kapi = set(fetch_pubkeys_kapi())
     print(f"Keys API: {len(kapi)} Keys")
     for url in EXECUTION_URLS:
         el_pool.urls, el_pool.current = [url], 0
+        try:
+            print(f"{url}: {el_diagnose(url)}")
+        except Exception as e:  # noqa: BLE001
+            print(f"{url}: Diagnose fehlgeschlagen: {e}")
         try:
             el = set(fetch_pubkeys_el())
             status = "OK" if el == kapi else f"ABWEICHUNG ({len(el ^ kapi)} Keys)"
