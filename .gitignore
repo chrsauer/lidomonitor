@@ -2,4 +2,7 @@
 data/
 state.json
 state.tmp
+# VC-Zuordnung ist intern und gehört nicht ins (öffentliche) Repo
+config/*
+!config/.gitkeep
 __pycache__/

@@ -7,6 +7,8 @@ services:
     env_file: .env
     volumes:
       - lidomonitor-data:/data
+      # VC-Zuordnung: ./config/validators.csv (Pubkey;Bezeichnung)
+      - ./config:/config:ro
     # Host-Netzwerk: Nodes auf demselben Server sind direkt über localhost
     # erreichbar (z. B. EXECUTION_URLS=http://localhost:8545).
     # Der Monitor öffnet selbst keine Ports.

@@ -10,16 +10,32 @@ Ein einzelnes Python-Skript ohne Abhängigkeiten. Es meldet in einem Telegram-Ch
 
 ## Schweregrade
 
+Verpasste Blöcke werden **pro VC** gezählt. Welcher Validator zu welchem VC gehört, steht in der CSV `config/validators.csv` (siehe unten).
+
 | Stufe | Bedingung (Standard) | Telegram |
 |---|---|---|
-| ⚠️ WARNUNG | einzelner verpasster Block | stumm (`WARN_SILENT`) |
-| 🔴 KRITISCH | ≥ 2 Duties **in Folge** verpasst (`CRIT_STREAK`) | mit Ton |
-| 🔴 KRITISCH | ≥ 3 der letzten 10 Duties verpasst (`CRIT_WINDOW_MISSES` / `CRIT_WINDOW`) | mit Ton |
-| ✅ ENTWARNUNG | erster Block nach einer kritischen Serie | mit Ton |
+| ⚠️ WARNUNG | ein VC verpasst einen Block, die vorige Duty dieses VC war erfolgreich | stumm (`WARN_SILENT`) |
+| 🔴 KRITISCH | **derselbe VC** verpasst ≥ 2 seiner Duties in Folge (`CRIT_STREAK`) | mit Ton |
+| ✅ ENTWARNUNG | dieser VC produziert danach wieder einen Block | mit Ton |
 
-„In Folge“ bezieht sich auf die Duties des ganzen Operators, nicht auf einen einzelnen Validator. Bei ca. 7.800 Validatoren kommt etwa alle 20–30 Minuten eine Duty. Zwei verpasste Duties hintereinander deuten deshalb auf ein systematisches Problem hin, z. B. Relay oder MEV-Boost, Beacon Node, Signer oder Netzwerk. Die Fenster-Regel erkennt zusätzlich Fehler, die nur zeitweise auftreten.
+Verpassen verschiedene VCs jeweils einzeln einen Block, bleibt es bei Warnungen. Validatoren ohne Eintrag in der CSV werden einzeln betrachtet. Ihre Meldungen zeigen keine VC-Bezeichnung.
 
-Hat derselbe Validator in den letzten 30 Tagen schon öfter verpasst, steht das zusätzlich in der Meldung. Das hilft, eine einzelne defekte VC-Instanz zu finden.
+Hat derselbe Validator in den letzten 30 Tagen schon öfter verpasst, steht das zusätzlich in der Meldung.
+
+## VC-Zuordnung (CSV)
+
+Die Datei `config/validators.csv` neben der `docker-compose.yml` ordnet Pubkeys den internen VC-Bezeichnungen zu:
+
+```
+Address;Node
+0x80029f0c…7f;10a
+0x80121919…d0;10a
+```
+
+- Trennzeichen `;`, `,` oder Tab, Kopfzeile optional, UTF-8 mit oder ohne BOM.
+- Die Datei wird schreibgeschützt nach `/config` gemountet. Änderungen erkennt der Monitor automatisch, ein Neustart ist nicht nötig.
+- `config/` steht in `.gitignore`. Die Zuordnung landet also nicht im Repo.
+- `check-keys` zeigt, wie viele Einträge zu Operator 17 gehören.
 
 Zusätzlich:
 - 📊 täglicher Bericht (stumm)
@@ -34,6 +50,7 @@ git clone https://github.com/chrsauer/lidomonitor.git
 cd lidomonitor
 cp .env.example .env
 nano .env          # Nodes, Telegram-Token und Chat-ID eintragen
+mkdir -p config && cp /pfad/zu/LidoVc.csv config/validators.csv
 chmod 600 .env
 
 docker compose build
@@ -82,15 +99,16 @@ Nach einem Neustart werden verpasste Slots nachgeholt, solange ein Beacon Node n
 ## Beispiel-Meldungen
 ```
 ⚠️ WARNUNG: Block verpasst – Lido Operator 17
-einzelner verpasster Block
-Validator: 1234567
+einzelner verpasster Block (VC 10a)
+Validator: 349949 · VC 10a
 Slot: 15392184 (Epoch 480993)
 ...
 
-🔴 KRITISCH: Block verpasst – Lido Operator 17
-2 Duties in Folge verpasst
+🔴 KRITISCH: VC 10a verpasst wiederholt – Lido Operator 17
+VC 10a: 2 Duties in Folge verpasst
+Validator: 349950 · VC 10a
 ...
 
-✅ ENTWARNUNG – Lido Operator 17
-Wieder Block produziert nach 3 verpassten Duties.
+✅ ENTWARNUNG: VC 10a – Lido Operator 17
+Wieder Block produziert nach 3 verpassten Duties in Folge.
 ```

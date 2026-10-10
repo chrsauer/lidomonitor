@@ -7,9 +7,11 @@ NodeOperatorsRegistry-Contract (über eigene Execution-Layer-Nodes, alternativ
 Lido Keys API), ermittelt die Validator-Indizes über eigene Beacon Nodes und
 prüft jede Proposer-Duty. Fehlt ein Block -> Telegram-Nachricht mit Schweregrad:
 
-  ⚠️ WARNUNG   einzelner verpasster Block (z. B. Latenz, Pech beim Timing)
-  🔴 KRITISCH  >= CRIT_STREAK verpasste Duties in Folge
-               oder >= CRIT_WINDOW_MISSES verpasste in den letzten CRIT_WINDOW Duties
+  ⚠️ WARNUNG   einzelner verpasster Block eines VC (z. B. Latenz, Timing)
+  🔴 KRITISCH  derselbe VC verpasst >= CRIT_STREAK seiner Duties in Folge
+
+Die VC-Zuordnung (Pubkey -> interne Bezeichnung) kommt aus einer CSV
+(VC_MAP_FILE). Validatoren ohne Eintrag werden einzeln betrachtet.
 
 Nur Python-Standardbibliothek, keine Abhängigkeiten.
 Konfiguration über Umgebungsvariablen oder eine .env-Datei neben dem Skript.
@@ -68,10 +70,11 @@ TG_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.environ.get("TELEGRAM_CHAT_ID", "")
 WARN_SILENT = os.environ.get("WARN_SILENT", "true").lower() == "true"
 
-# Schweregrade
+# Schweregrad: KRITISCH, wenn derselbe VC so viele seiner Duties in Folge verpasst
 CRIT_STREAK = int(os.environ.get("CRIT_STREAK", "2"))
-CRIT_WINDOW = int(os.environ.get("CRIT_WINDOW", "10"))
-CRIT_WINDOW_MISSES = int(os.environ.get("CRIT_WINDOW_MISSES", "3"))  # 0 = aus
+
+# CSV mit Pubkey -> interne VC-Bezeichnung (Spalten: Pubkey;Bezeichnung)
+VC_MAP_FILE = Path(os.environ.get("VC_MAP_FILE", str(BASE_DIR / "config" / "validators.csv")))
 
 # Sonstiges
 CONFIRM_SLOTS = int(os.environ.get("CONFIRM_SLOTS", "3"))  # Reorg-Puffer
@@ -276,6 +279,30 @@ def resolve_validators(pubkeys: list[str]) -> dict[int, str]:
 
 
 # --------------------------------------------------------------------------- #
+# VC-Zuordnung
+# --------------------------------------------------------------------------- #
+def load_vc_map(path: Path) -> dict[str, str]:
+    """Liest Pubkey -> Bezeichnung. Trennzeichen ; , oder Tab, Kopfzeile optional."""
+    mapping: dict[str, str] = {}
+    if not path.is_file():
+        return mapping
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        for sep in (";", ",", "\t"):
+            if sep in line:
+                key, _, label = line.partition(sep)
+                break
+        else:
+            continue
+        key, label = key.strip().strip('"').lower(), label.strip().strip('"')
+        if not key.startswith("0x"):
+            key = "0x" + key
+        if len(key) == 2 + 2 * PUBKEY_LEN and label:
+            mapping[key] = label
+    return mapping
+
+
+# --------------------------------------------------------------------------- #
 # State
 # --------------------------------------------------------------------------- #
 def load_state() -> dict:
@@ -309,9 +336,12 @@ class Monitor:
         self.error_since: float | None = None
         self.error_alerted = False
         self.state.setdefault("daily", new_daily())
-        self.state.setdefault("streak", 0)  # verpasste Duties in Folge
-        self.state.setdefault("recent", [])  # letzte Duties: 1 = Block, 0 = verpasst
+        self.state.setdefault("streaks", {})  # VC (oder Validator) -> verpasste in Folge
         self.state.setdefault("val_misses", {})  # validator -> [slots]
+        for old in ("streak", "recent"):  # alte Version
+            self.state.pop(old, None)
+        self.vc_map: dict[str, str] = {}
+        self.vc_map_mtime = 0.0
 
     # -- Keys ---------------------------------------------------------------
     def refresh_keys(self, force: bool = False) -> None:
@@ -327,6 +357,28 @@ class Monitor:
             log.error("Konnte Keys nicht aktualisieren: %s", e)
             if not self.validators:
                 raise
+
+    def refresh_vc_map(self) -> None:
+        """CSV neu laden, sobald sie sich ändert (kein Neustart nötig)."""
+        try:
+            mtime = VC_MAP_FILE.stat().st_mtime
+        except FileNotFoundError:
+            if self.vc_map:
+                log.warning("VC-Zuordnung %s nicht mehr vorhanden", VC_MAP_FILE)
+            self.vc_map, self.vc_map_mtime = {}, 0.0
+            return
+        if mtime == self.vc_map_mtime:
+            return
+        self.vc_map = load_vc_map(VC_MAP_FILE)
+        self.vc_map_mtime = mtime
+        mapped = sum(1 for pk in self.validators.values() if pk.lower() in self.vc_map)
+        log.info(
+            "VC-Zuordnung: %d Einträge, davon %d aktive Validatoren zugeordnet",
+            len(self.vc_map), mapped,
+        )
+
+    def vc_of(self, idx: int) -> str | None:
+        return self.vc_map.get(self.validators[idx].lower())
 
     # -- Beacon -------------------------------------------------------------
     def get_duties(self, epoch: int) -> dict[int, int] | None:
@@ -368,22 +420,10 @@ class Monitor:
         return False
 
     # -- Schweregrad --------------------------------------------------------
-    def record(self, ok: bool) -> None:
-        recent = self.state["recent"]
-        recent.append(1 if ok else 0)
-        del recent[:-CRIT_WINDOW]
-
-    def severity(self) -> tuple[str, str]:
-        streak = self.state["streak"]
-        window_misses = self.state["recent"].count(0)
-        if streak >= CRIT_STREAK:
-            return "critical", f"{streak} Duties in Folge verpasst"
-        if CRIT_WINDOW_MISSES and window_misses >= CRIT_WINDOW_MISSES:
-            return (
-                "critical",
-                f"{window_misses} der letzten {len(self.state['recent'])} Duties verpasst",
-            )
-        return "warning", "einzelner verpasster Block"
+    @staticmethod
+    def group_key(idx: int, vc: str | None) -> str:
+        """Fehler werden pro VC gezählt, ohne Zuordnung pro Validator."""
+        return f"vc:{vc}" if vc else f"val:{idx}"
 
     def validator_misses(self, idx: int, slot: int) -> int:
         vm = self.state["val_misses"]
@@ -404,37 +444,44 @@ class Monitor:
         proposer = duties.get(slot)
         if proposer is None or proposer not in self.validators:
             return
+        vc = self.vc_of(proposer)
+        group = self.group_key(proposer, vc)
+        who = f"VC {html.escape(vc)}" if vc else f"Validator {proposer}"
         vlink = f'<a href="{EXPLORER}/validator/{proposer}">{proposer}</a>'
+        if vc:
+            vlink += f" · VC <b>{html.escape(vc)}</b>"
         slink = f'<a href="{EXPLORER}/slot/{slot}">{slot}</a>'
+        streaks = self.state["streaks"]
 
         if self.block_exists(slot):
-            log.info("Slot %d: Block von Validator %d ✓", slot, proposer)
-            prev_streak = self.state["streak"]
-            self.state["streak"] = 0
-            self.record(True)
+            log.info("Slot %d: Block von Validator %d%s ✓", slot, proposer, f" ({vc})" if vc else "")
+            prev = streaks.pop(group, 0)
             self.state["daily"]["proposed"] += 1
-            if prev_streak >= CRIT_STREAK:
+            if prev >= CRIT_STREAK:
                 telegram(
-                    f"✅ <b>ENTWARNUNG</b> – Lido Operator {OPERATOR_ID}\n"
-                    f"Wieder Block produziert nach {prev_streak} verpassten Duties.\n"
+                    f"✅ <b>ENTWARNUNG: {who}</b> – Lido Operator {OPERATOR_ID}\n"
+                    f"Wieder Block produziert nach {prev} verpassten Duties in Folge.\n"
                     f"Slot {slink} · Validator {vlink}"
                 )
             elif NOTIFY_PROPOSED:
                 telegram(f"✅ Block vorgeschlagen · Slot {slink} · Validator {vlink}", silent=True)
             return
 
-        self.state["streak"] += 1
-        self.record(False)
-        level, reason = self.severity()
+        streak = streaks.get(group, 0) + 1
+        streaks[group] = streak
+        if streak >= CRIT_STREAK:
+            level, reason = "critical", f"{who}: {streak} Duties in Folge verpasst"
+        else:
+            level, reason = "warning", f"einzelner verpasster Block ({who})"
         n_val = self.validator_misses(proposer, slot)
         d = self.state["daily"]
         d["missed"] += 1
         d["critical"] += level == "critical"
-        d["missed_list"].append([slot, proposer, level])
+        d["missed_list"].append([slot, proposer, level, vc])
         log.warning("Slot %d: KEIN Block von Validator %d [%s: %s]", slot, proposer, level, reason)
 
         if level == "critical":
-            head = f"🔴 <b>KRITISCH: Block verpasst</b> – Lido Operator {OPERATOR_ID}"
+            head = f"🔴 <b>KRITISCH: {who} verpasst wiederholt</b> – Lido Operator {OPERATOR_ID}"
         else:
             head = f"⚠️ <b>WARNUNG: Block verpasst</b> – Lido Operator {OPERATOR_ID}"
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -473,7 +520,10 @@ class Monitor:
             for entry in d["missed_list"][-20:]:
                 s, v = entry[0], entry[1]
                 icon = "🔴" if len(entry) > 2 and entry[2] == "critical" else "⚠️"
-                lines.append(f'{icon} Slot {s} – Validator <a href="{EXPLORER}/validator/{v}">{v}</a>')
+                vc = f" · VC {html.escape(entry[3])}" if len(entry) > 3 and entry[3] else ""
+                lines.append(
+                    f'{icon} Slot {s} – Validator <a href="{EXPLORER}/validator/{v}">{v}</a>{vc}'
+                )
         telegram("\n".join(lines), silent=True)
         self.state["summary_sent"] = today
         self.state["daily"] = new_daily()
@@ -481,6 +531,7 @@ class Monitor:
 
     def tick(self) -> None:
         self.refresh_keys()
+        self.refresh_vc_map()
         head = self.head_slot()
         target = head - CONFIRM_SLOTS
         # Duties der aktuellen und nächsten Epoch vorab cachen, solange der
@@ -507,9 +558,10 @@ class Monitor:
             try:
                 self.tick()
                 if not started:
+                    mapped = sum(1 for i in self.validators if self.vc_of(i))
                     telegram(
                         f"🟢 Monitor gestartet – Lido Operator {OPERATOR_ID}\n"
-                        f"{len(self.validators)} Validatoren · "
+                        f"{len(self.validators)} Validatoren ({mapped} mit VC-Zuordnung) · "
                         f"{len(BEACON_URLS)} Beacon / {len(EXECUTION_URLS)} EL Nodes",
                         silent=True,
                     )
@@ -592,6 +644,19 @@ def check_keys() -> None:
             print(f"{url}: {len(el)} Keys – {status}")
         except Exception as e:  # noqa: BLE001
             print(f"{url}: FEHLER {e}")
+
+    vc_map = load_vc_map(VC_MAP_FILE)
+    if not vc_map:
+        print(f"VC-Zuordnung: keine Datei unter {VC_MAP_FILE}")
+        return
+    deposited = {k.lower() for k in kapi}
+    known = sum(1 for k in vc_map if k in deposited)
+    vcs = sorted(set(vc_map.values()))
+    print(
+        f"VC-Zuordnung: {len(vc_map)} Einträge in {len(vcs)} VCs, "
+        f"{known} davon gehören zu Operator {OPERATOR_ID}"
+        + (f", {len(vc_map) - known} UNBEKANNT" if known < len(vc_map) else "")
+    )
 
 
 if __name__ == "__main__":
